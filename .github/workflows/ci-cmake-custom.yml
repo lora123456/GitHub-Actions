@@ -1,1 +1,219 @@
-<INSERT ci-cmake-custom.yml FROM ABOVE>
+name: CI • CMake (custom, vcpkg, release)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      ctest_pattern:
+        description: 'Regex for ctest -R (overrides default)'
+        required: false
+      release_tag:
+        description: 'Tag name to create GitHub Release (e.g. v1.0.0)'
+        required: false
+      cmake_defs:
+        description: 'Extra -D flags (space-separated)'
+        required: false
+
+concurrency:
+  group: cmake-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_EXTRA_DEFS: >
+    -DAPP_VERSION=${{ github.sha }}
+    -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>
+  CTEST_PATTERN: 'unit|integration'
+  VCPKG_DEFAULT_TRIPLET: 'x64-linux'
+
+jobs:
+  ubuntu:
+    name: Ubuntu • GCC + Ninja + ASan + Package
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Bootstrap vcpkg (optional)
+        if: hashFiles('vcpkg.json') != ''
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.sh
+          echo "VCPKG_ROOT=$GITHUB_WORKSPACE/vcpkg" >> $GITHUB_ENV
+          echo "TOOLCHAIN=$GITHUB_WORKSPACE/vcpkg/scripts/buildsystems/vcpkg.cmake" >> $GITHUB_ENV
+
+      - name: Cache vcpkg
+        if: hashFiles('vcpkg.json') != ''
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/vcpkg/archives
+            ${{ env.VCPKG_ROOT }}/installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json','vcpkg-lock.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Configure (Release + ASan)
+        run: |
+          CFLAGS="-fsanitize=address -fno-omit-frame-pointer"
+          CXXFLAGS="-fsanitize=address -fno-omit-frame-pointer"
+          EXTRA="${{ env.CMAKE_EXTRA_DEFS }} ${{ github.event.inputs.cmake_defs }}"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            ${TOOLCHAIN:+-DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN}} \
+            -DCMAKE_C_FLAGS="$CFLAGS" \
+            -DCMAKE_CXX_FLAGS="$CXXFLAGS" \
+            $EXTRA
+
+      - name: Build
+        run: cmake --build build --config Release -- -v
+
+      - name: Test (ctest)
+        run: |
+          PATTERN="${{ github.event.inputs.ctest_pattern || env.CTEST_PATTERN }}"
+          if [ -z "$PATTERN" ]; then
+            ctest --test-dir build -C Release --output-on-failure
+          else
+            ctest --test-dir build -C Release -R "$PATTERN" --output-on-failure
+          fi
+
+      - name: Try CPack (ZIP)
+        run: |
+          if [ -f build/CPackConfig.cmake ]; then
+            (cd build && cpack -G ZIP)
+          else
+            echo "No CPackConfig.cmake — skipping CPack ZIP."
+          fi
+
+      - name: Fallback ZIP (if no CPack)
+        run: |
+          if compgen -G "build/*.zip" > /dev/null; then
+            echo "CPack produced ZIP(s)."
+          else
+            mkdir -p out && cp -r build out/bin && (cd out && zip -r ../artifact-ubuntu.zip .)
+          fi
+
+      - name: Upload Ubuntu artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-artifacts
+          path: |
+            build/*.zip
+            artifact-ubuntu.zip
+          if-no-files-found: warn
+
+  windows:
+    name: Windows • MSVC + Ninja + NSIS/ZIP
+    runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bootstrap vcpkg (optional)
+        if: hashFiles('vcpkg.json') != ''
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat
+          "VCPKG_ROOT=$env:GITHUB_WORKSPACE\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "TOOLCHAIN=$env:GITHUB_WORKSPACE\vcpkg\scripts\buildsystems\vcpkg.cmake" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Cache vcpkg
+        if: hashFiles('vcpkg.json') != ''
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_ROOT }}\installed
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json','vcpkg-lock.json') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Install NSIS (for CPack NSIS)
+        shell: pwsh
+        run: choco install nsis -y
+
+      - name: Configure (Release)
+        shell: pwsh
+        run: |
+          $defs = "${{ env.CMAKE_EXTRA_DEFS }} ${{ github.event.inputs.cmake_defs }}".Trim()
+          cmake -S . -B build -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            ${env:TOOLCHAIN:+-DCMAKE_TOOLCHAIN_FILE=$env:TOOLCHAIN} `
+            $defs
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release -- -v
+
+      - name: Test (ctest)
+        shell: pwsh
+        run: |
+          $pattern = "${{ github.event.inputs.ctest_pattern }}"
+          if ([string]::IsNullOrEmpty($pattern)) { $pattern = "${{ env.CTEST_PATTERN }}" }
+          if ([string]::IsNullOrEmpty($pattern)) {
+            ctest --test-dir build -C Release --output-on-failure
+          } else {
+            ctest --test-dir build -C Release -R "$pattern" --output-on-failure
+          }
+
+      - name: Try CPack (ZIP + NSIS)
+        shell: pwsh
+        run: |
+          if (Test-Path build\CPackConfig.cmake) {
+            cmake --build build --target package
+            Push-Location build
+            cpack -G ZIP
+            cpack -G NSIS
+            Pop-Location
+          } else {
+            Write-Host "No CPackConfig.cmake — skipping CPack."
+          }
+
+      - name: Fallback ZIP (if no CPack)
+        shell: pwsh
+        run: |
+          if (-not (Get-ChildItem build\*.zip -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType Directory out | Out-Null
+            Copy-Item -Recurse build out\bin
+            Compress-Archive -Path out\* -DestinationPath artifact-windows.zip -Force
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            build\*.zip
+            build\*.exe
+            artifact-windows.zip
+          if-no-files-found: warn
+
+  release:
+    name: Create GitHub Release (if tag provided)
+    needs: [ubuntu, windows]
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.release_tag != '' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./dist
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Release ${{ github.event.inputs.release_tag }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/**/artifact-ubuntu.zip
+            dist/**/artifact-windows.zip
+            dist/**/.zip
+            dist/**/.exe
