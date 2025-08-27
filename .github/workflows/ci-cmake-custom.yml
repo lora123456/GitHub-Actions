@@ -56,7 +56,7 @@ jobs:
         with:
           path: |
             ~/.cache/vcpkg/archives
-            ${{ env.VCPKG_ROOT }}/installed
+            ${{ github.workspace }}/vcpkg/installed
           key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json','vcpkg-lock.json') }}
           restore-keys: vcpkg-${{ runner.os }}-
 
@@ -132,7 +132,7 @@ jobs:
         if: hashFiles('vcpkg.json') != ''
         uses: actions/cache@v4
         with:
-          path: ${{ env.VCPKG_ROOT }}\installed
+          path: ${{ github.workspace }}\vcpkg\installed
           key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json','vcpkg-lock.json') }}
           restore-keys: vcpkg-${{ runner.os }}-
 
